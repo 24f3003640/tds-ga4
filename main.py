@@ -196,6 +196,21 @@ def parse_json(s):
 async def root():
     return {"ok": True, "email": config.EMAIL}
 
+def is_answerable(val):
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, (int, float)):
+        return val > 0
+    if isinstance(val, str):
+        return val.strip().lower() in ("true", "yes", "1")
+    return False
+
+def parse_confidence(val):
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return 0.5
+
 # ================= Q3: /grounded-answer =================
 @app.post("/grounded-answer")
 async def q3_answer(request: Request):
@@ -205,34 +220,44 @@ async def q3_answer(request: Request):
     prompt = (
         "You are a highly reliable Grounded QA API for medical and legal compliance.\n"
         "Your task is to answer the user's question strictly using ONLY the provided context chunks.\n"
-        "1. If the question CANNOT be answered from the chunks, you MUST return:\n"
+        "1. If the question CANNOT be fully answered from the chunks (or if context is missing/irrelevant), you MUST return:\n"
         "   - answerable: false\n"
-        "   - answer: \"I don't know\" (exact match)\n"
-        "   - citations: [] (empty array)\n"
+        "   - answer: \"I don't know\"\n"
+        "   - citations: []\n"
         "   - confidence: 0.1\n"
-        "2. If it CAN be answered, return:\n"
+        "2. If it CAN be answered strictly from the chunks, return:\n"
         "   - answerable: true\n"
         "   - answer: <your grounded answer>\n"
-        "   - citations: [<list of ONLY the chunk_ids you used>]\n"
+        "   - citations: [<list of chunk_id strings used>]\n"
         "   - confidence: <float between 0.8 and 1.0>\n"
         "NEVER use outside knowledge. Return strictly JSON with exactly these 4 keys.\n\n"
         f"QUESTION:\n{question}\n\n"
         f"CHUNKS:\n{json.dumps(chunks, indent=2)}"
     )
     try:
-        out = parse_json(await chat([{"role": "user", "content": prompt}], model="gpt-4o-mini", max_tokens=1000))
-        if not out.get("answerable", False) or out.get("confidence", 1.0) <= 0.3:
+        out = parse_json(await chat([{"role": "user", "content": prompt}], model=config.TEXT_MODEL, max_tokens=1000))
+        ans_bool = is_answerable(out.get("answerable"))
+        conf_val = parse_confidence(out.get("confidence", 0.9 if ans_bool else 0.1))
+        
+        if not ans_bool or conf_val <= 0.3:
             return {"answer": "I don't know", "citations": [], "confidence": 0.1, "answerable": False}
-        valid_ids = [c["chunk_id"] for c in chunks]
-        cites = [c for c in out.get("citations", []) if c in valid_ids]
+        
+        valid_ids = set(c["chunk_id"] for c in chunks if isinstance(c, dict) and "chunk_id" in c)
+        raw_cites = out.get("citations", [])
+        if isinstance(raw_cites, list):
+            cites = [c for c in raw_cites if c in valid_ids]
+        else:
+            cites = []
+            
         return {
-            "answer": out.get("answer", "I don't know"),
+            "answer": str(out.get("answer", "I don't know")),
             "citations": cites,
-            "confidence": float(out.get("confidence", 0.9)),
+            "confidence": float(conf_val if conf_val >= 0.5 else 0.9),
             "answerable": True
         }
     except Exception:
         return {"answer": "I don't know", "citations": [], "confidence": 0.1, "answerable": False}
+
 
 # ================= Q4: /vector-search =================
 def cosine_sim(a, b):
