@@ -1,4 +1,3 @@
-# GA4 FastAPI Backend Service
 import json, re, hashlib, os, math, struct
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
@@ -130,19 +129,15 @@ Q4_DOCS = []
 Q4_EMBEDDINGS = {}
 Q4_RERANKER = {}
 
-def ensure_q4_data():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     global Q4_DOCS, Q4_EMBEDDINGS, Q4_RERANKER
-    if not Q4_DOCS:
+    try:
         docs, embs, reranker = generate_q4(config.EMAIL)
         Q4_DOCS = docs
         Q4_EMBEDDINGS = {k: np.array(v, dtype=np.float32) for k, v in embs.items()}
         Q4_RERANKER = reranker
         print(f"Q4 data generated for {config.EMAIL}: {len(Q4_DOCS)} docs.")
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    try:
-        ensure_q4_data()
     except Exception as e:
         print(f"Failed to generate Q4 data: {e}")
     yield
@@ -188,8 +183,6 @@ async def chat(messages, model=None, max_tokens=800, force_json=True, retries=4)
     raise RuntimeError(f"chat failed after {retries} retries: {last_err}")
 
 def parse_json(s):
-    if not isinstance(s, str):
-        return {}
     s = s.strip()
     if s.startswith("```"):
         s = re.sub(r"^```[a-z]*\n?|\n?```$", "", s).strip()
@@ -197,31 +190,11 @@ def parse_json(s):
         return json.loads(s)
     except Exception:
         m = re.search(r"\{.*\}", s, re.DOTALL)
-        if m:
-            try:
-                return json.loads(m.group(0))
-            except Exception:
-                pass
-        return {}
+        return json.loads(m.group(0)) if m else {}
 
 @app.api_route("/", methods=["GET", "HEAD"])
 async def root():
     return {"ok": True, "email": config.EMAIL}
-
-def is_answerable(val):
-    if isinstance(val, bool):
-        return val
-    if isinstance(val, (int, float)):
-        return val > 0
-    if isinstance(val, str):
-        return val.strip().lower() in ("true", "yes", "1")
-    return False
-
-def parse_confidence(val):
-    try:
-        return float(val)
-    except (ValueError, TypeError):
-        return 0.5
 
 # ================= Q3: /grounded-answer =================
 @app.post("/grounded-answer")
@@ -229,56 +202,33 @@ async def q3_answer(request: Request):
     body = await request.json()
     question = body.get("question", "")
     chunks = body.get("chunks", [])
-    
     prompt = (
-        "You are a strict, zero-hallucination Grounded QA system for legal and medical compliance.\n"
-        "Your task is to determine whether the user's question can be answered strictly and exclusively from the provided text chunks.\n\n"
-        "CRITICAL RULES:\n"
-        "1. Read the chunks very carefully. If the exact information needed to answer the question is NOT explicitly present in the provided chunks, you MUST set answerable to false.\n"
-        "2. Do NOT use any outside knowledge, assumptions, or external facts. Even if a statement is generally true in the real world, if it is NOT written in the provided chunks, the question is UNANSWERABLE.\n"
-        "3. If UNANSWERABLE (answerable: false):\n"
+        "You are a highly reliable Grounded QA API for medical and legal compliance.\n"
+        "Your task is to answer the user's question strictly using ONLY the provided context chunks.\n"
+        "1. If the question CANNOT be answered from the chunks, you MUST return:\n"
         "   - answerable: false\n"
-        "   - answer: \"I don't know\"\n"
-        "   - citations: []\n"
+        "   - answer: \"I don't know\" (exact match)\n"
+        "   - citations: [] (empty array)\n"
         "   - confidence: 0.1\n"
-        "4. If ANSWERABLE (answerable: true):\n"
+        "2. If it CAN be answered, return:\n"
         "   - answerable: true\n"
-        "   - answer: <factual answer derived strictly from the text chunks>\n"
-        "   - citations: [<list of chunk_id strings containing the evidence>]\n"
-        "   - confidence: <float between 0.8 and 1.0>\n\n"
-        "Return strictly JSON with keys: answerable, answer, citations, confidence.\n\n"
+        "   - answer: <your grounded answer>\n"
+        "   - citations: [<list of ONLY the chunk_ids you used>]\n"
+        "   - confidence: <float between 0.8 and 1.0>\n"
+        "NEVER use outside knowledge. Return strictly JSON with exactly these 4 keys.\n\n"
         f"QUESTION:\n{question}\n\n"
         f"CHUNKS:\n{json.dumps(chunks, indent=2)}"
     )
     try:
-        out = parse_json(await chat([{"role": "user", "content": prompt}], model=config.TEXT_MODEL, max_tokens=1000))
-        ans_bool = is_answerable(out.get("answerable"))
-        
-        if not ans_bool:
+        out = parse_json(await chat([{"role": "user", "content": prompt}], model="gpt-4o-mini", max_tokens=1000))
+        if not out.get("answerable", False) or out.get("confidence", 1.0) <= 0.3:
             return {"answer": "I don't know", "citations": [], "confidence": 0.1, "answerable": False}
-        
-        valid_ids = set(c["chunk_id"] for c in chunks if isinstance(c, dict) and "chunk_id" in c)
-        raw_cites = out.get("citations", [])
-        if isinstance(raw_cites, list):
-            cites = [c for c in raw_cites if c in valid_ids]
-        else:
-            cites = []
-            
-        if not cites and valid_ids:
-            cites = list(valid_ids)[:1]
-            
-        conf_val = parse_confidence(out.get("confidence", 0.9))
-        if conf_val < 0.8:
-            conf_val = 0.9
-            
-        ans_text = str(out.get("answer", "")).strip()
-        if not ans_text or ans_text.lower() == "i don't know":
-            return {"answer": "I don't know", "citations": [], "confidence": 0.1, "answerable": False}
-
+        valid_ids = [c["chunk_id"] for c in chunks]
+        cites = [c for c in out.get("citations", []) if c in valid_ids]
         return {
-            "answer": ans_text,
+            "answer": out.get("answer", "I don't know"),
             "citations": cites,
-            "confidence": float(conf_val),
+            "confidence": float(out.get("confidence", 0.9)),
             "answerable": True
         }
     except Exception:
@@ -294,42 +244,29 @@ def cosine_sim(a, b):
 
 @app.post("/vector-search")
 async def vector_search(request: Request):
-    ensure_q4_data()
     body = await request.json()
     query_id = body.get("query_id")
     query_vector = np.array(body.get("query_vector", []), dtype=np.float32)
-    top_k = int(body.get("top_k", 10))
-    rerank_top_n = int(body.get("rerank_top_n", 3))
-    filters = body.get("filter") or body.get("filters") or {}
-
+    top_k = body.get("top_k", 10)
+    rerank_top_n = body.get("rerank_top_n", 3)
+    filters = body.get("filter", {})
     # 1. Filter documents
     filtered_docs = []
     for doc in Q4_DOCS:
         match = True
-        if isinstance(filters, dict):
-            for key, condition in filters.items():
-                val = doc.get(key)
-                if isinstance(condition, dict):
-                    if "gte" in condition and not (val is not None and val >= condition["gte"]):
-                        match = False
-                    if "lte" in condition and not (val is not None and val <= condition["lte"]):
-                        match = False
-                    if "gt" in condition and not (val is not None and val > condition["gt"]):
-                        match = False
-                    if "lt" in condition and not (val is not None and val < condition["lt"]):
-                        match = False
-                    if "in" in condition and val not in condition["in"]:
-                        match = False
-                    if "eq" in condition and val != condition["eq"]:
-                        match = False
-                    if "ne" in condition and val == condition["ne"]:
-                        match = False
-                else:
-                    if val != condition:
-                        match = False
+        for key, condition in filters.items():
+            if isinstance(condition, dict):
+                if "gte" in condition and not (doc.get(key, 0) >= condition["gte"]):
+                    match = False
+                if "lte" in condition and not (doc.get(key, 0) <= condition["lte"]):
+                    match = False
+                if "in" in condition and doc.get(key) not in condition["in"]:
+                    match = False
+            else:
+                if doc.get(key) != condition:
+                    match = False
         if match:
             filtered_docs.append(doc)
-
     # 2. Cosine similarity
     scored_docs = []
     for doc in filtered_docs:
@@ -338,106 +275,43 @@ async def vector_search(request: Request):
         if doc_emb is not None:
             sim = cosine_sim(query_vector, doc_emb)
             scored_docs.append({"doc_id": doc_id, "sim": sim})
-
     # 3. Top-k (desc sim, tie-break lexicographic)
     scored_docs.sort(key=lambda x: (-x["sim"], x["doc_id"]))
     top_k_docs = scored_docs[:top_k]
-
     # 4. Re-rank
     rerank_scores = Q4_RERANKER.get(query_id, {})
     for doc in top_k_docs:
         doc["rerank_score"] = rerank_scores.get(doc["doc_id"], -999.0)
-
     top_k_docs.sort(key=lambda x: (-x["rerank_score"], x["doc_id"]))
     return {"matches": [d["doc_id"] for d in top_k_docs[:rerank_top_n]]}
 
 # ================= Q5: GraphRAG Endpoints =================
-VALID_ENTITY_TYPES = {
-    "person": "Person",
-    "organization": "Organization",
-    "product": "Product",
-    "framework": "Framework"
-}
-
-VALID_RELATIONS = {
-    "founded": "FOUNDED",
-    "developed": "DEVELOPED",
-    "integrated_into": "INTEGRATED_INTO",
-    "integratedinto": "INTEGRATED_INTO",
-    "hired": "HIRED",
-    "authored": "AUTHORED"
-}
-
 @app.post("/extract-graph")
 async def extract_graph(request: Request):
     body = await request.json()
-    text = body.get("text", "") or body.get("content", "")
+    text = body.get("text", "")
     prompt = (
         "You are an expert GraphRAG Entity and Relationship extractor.\n"
-        "Extract ALL valid entities and ALL valid relationships from the text.\n\n"
-        "ALLOWED ENTITY TYPES ONLY:\n"
-        "- Person\n"
-        "- Organization\n"
-        "- Product\n"
-        "- Framework\n\n"
-        "ALLOWED RELATIONSHIP TYPES ONLY:\n"
-        "- FOUNDED\n"
-        "- DEVELOPED\n"
-        "- INTEGRATED_INTO\n"
-        "- HIRED\n"
-        "- AUTHORED\n\n"
-        "Rules:\n"
-        "1. Identify every person, company/organization, software/hardware product, and framework/library mentioned.\n"
-        "2. Identify every clear relationship between these entities matching one of the 5 allowed relationship types.\n"
-        "3. Output strictly a JSON object formatted as:\n"
+        "Extract entities and relationships from the provided text according to these EXACT rules:\n"
+        "Allowed Entity Types: Person, Organization, Product, Framework\n"
+        "Allowed Relationship Types: FOUNDED, DEVELOPED, INTEGRATED_INTO, HIRED, AUTHORED\n\n"
+        "Return strictly JSON in this format:\n"
         "{\n"
-        "  \"entities\": [{\"name\": \"Entity Name\", \"type\": \"Person|Organization|Product|Framework\"}],\n"
-        "  \"relationships\": [{\"source\": \"Entity1\", \"target\": \"Entity2\", \"relation\": \"FOUNDED|DEVELOPED|INTEGRATED_INTO|HIRED|AUTHORED\"}]\n"
+        "  \"entities\": [{\"name\": \"Entity Name\", \"type\": \"AllowedType\"}],\n"
+        "  \"relationships\": [{\"source\": \"Entity1\", \"target\": \"Entity2\", \"relation\": \"ALLOWED_RELATION\"}]\n"
         "}\n\n"
-        f"TEXT TO EXTRACT FROM:\n{text}"
+        f"TEXT:\n{text}"
     )
     try:
-        out = parse_json(await chat([{"role": "user", "content": prompt}], model=config.TEXT_MODEL, max_tokens=2500))
-        raw_entities = out.get("entities", [])
-        raw_relationships = out.get("relationships", [])
-
-        clean_entities = []
-        seen_entities = set()
-        if isinstance(raw_entities, list):
-            for e in raw_entities:
-                if isinstance(e, dict) and "name" in e and "type" in e:
-                    name = str(e["name"]).strip()
-                    raw_type = str(e["type"]).strip().lower()
-                    if name and raw_type in VALID_ENTITY_TYPES:
-                        canon_type = VALID_ENTITY_TYPES[raw_type]
-                        key = (name.lower(), canon_type)
-                        if key not in seen_entities:
-                            seen_entities.add(key)
-                            clean_entities.append({"name": name, "type": canon_type})
-
-        clean_rels = []
-        seen_rels = set()
-        if isinstance(raw_relationships, list):
-            for r in raw_relationships:
-                if isinstance(r, dict) and "source" in r and "target" in r and "relation" in r:
-                    src = str(r["source"]).strip()
-                    tgt = str(r["target"]).strip()
-                    raw_rel = str(r["relation"]).strip().lower().replace(" ", "_").replace("-", "_")
-                    if src and tgt and raw_rel in VALID_RELATIONS:
-                        canon_rel = VALID_RELATIONS[raw_rel]
-                        key = (src.lower(), tgt.lower(), canon_rel)
-                        if key not in seen_rels:
-                            seen_rels.add(key)
-                            clean_rels.append({"source": src, "target": tgt, "relation": canon_rel})
-
-        return {"entities": clean_entities, "relationships": clean_rels}
+        out = parse_json(await chat([{"role": "user", "content": prompt}], model="gpt-4o", max_tokens=1500))
+        return {"entities": out.get("entities", []), "relationships": out.get("relationships", [])}
     except Exception:
         return {"entities": [], "relationships": []}
 
 @app.post("/graph-query")
 async def graph_query(request: Request):
     body = await request.json()
-    question = body.get("question", "") or body.get("query", "")
+    question = body.get("question", "")
     graph = body.get("graph", {})
     prompt = (
         "You are a GraphRAG multi-hop reasoning agent.\n"
@@ -453,21 +327,16 @@ async def graph_query(request: Request):
         f"GRAPH:\n{json.dumps(graph, indent=2)}"
     )
     try:
-        out = parse_json(await chat([{"role": "user", "content": prompt}], model=config.TEXT_MODEL, max_tokens=1500))
+        out = parse_json(await chat([{"role": "user", "content": prompt}], model="gpt-4o", max_tokens=1500))
         path = out.get("reasoning_path", [])
-        if not isinstance(path, list):
-            path = []
-        hops = out.get("hops")
-        if hops is None or not isinstance(hops, int):
-            hops = max(0, len(path) - 1) if path else 0
-        return {"answer": str(out.get("answer", "")), "reasoning_path": path, "hops": int(hops)}
+        return {"answer": out.get("answer", ""), "reasoning_path": path, "hops": len(path) - 1 if path else 0}
     except Exception:
         return {"answer": "", "reasoning_path": [], "hops": 0}
 
 @app.post("/community-summary")
 async def community_summary(request: Request):
     body = await request.json()
-    community_id = str(body.get("community_id", "") or body.get("id", ""))
+    community_id = body.get("community_id", "")
     entities = body.get("entities", [])
     relationships = body.get("relationships", [])
     prompt = (
@@ -482,7 +351,7 @@ async def community_summary(request: Request):
         f"RELATIONSHIPS:\n{json.dumps(relationships, indent=2)}"
     )
     try:
-        out = parse_json(await chat([{"role": "user", "content": prompt}], model=config.TEXT_MODEL, max_tokens=1500))
-        return {"community_id": community_id, "summary": str(out.get("summary", ""))}
+        out = parse_json(await chat([{"role": "user", "content": prompt}], model="gpt-4o", max_tokens=1500))
+        return {"community_id": community_id, "summary": out.get("summary", "")}
     except Exception:
         return {"community_id": community_id, "summary": ""}
