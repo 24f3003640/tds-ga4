@@ -1,6 +1,5 @@
 # GA4 FastAPI Backend Service
 import json, re, hashlib, os, math, struct
-
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -232,21 +231,22 @@ async def q3_answer(request: Request):
     chunks = body.get("chunks", [])
     
     prompt = (
-        "You are a highly reliable Grounded QA API for medical and legal compliance.\n"
-        "Your task is to answer the user's question strictly using ONLY the provided context chunks.\n\n"
-        "INSTRUCTIONS:\n"
-        "1. Carefully check if the context chunks contain enough information to answer the question.\n"
-        "2. If the context chunks DO NOT contain sufficient information (or if answer cannot be determined from chunks), set:\n"
+        "You are a strict, zero-hallucination Grounded QA system for legal and medical compliance.\n"
+        "Your task is to determine whether the user's question can be answered strictly and exclusively from the provided text chunks.\n\n"
+        "CRITICAL RULES:\n"
+        "1. Read the chunks very carefully. If the exact information needed to answer the question is NOT explicitly present in the provided chunks, you MUST set answerable to false.\n"
+        "2. Do NOT use any outside knowledge, assumptions, or external facts. Even if a statement is generally true in the real world, if it is NOT written in the provided chunks, the question is UNANSWERABLE.\n"
+        "3. If UNANSWERABLE (answerable: false):\n"
         "   - answerable: false\n"
         "   - answer: \"I don't know\"\n"
         "   - citations: []\n"
         "   - confidence: 0.1\n"
-        "3. If the context chunks DO contain information to answer the question, set:\n"
+        "4. If ANSWERABLE (answerable: true):\n"
         "   - answerable: true\n"
-        "   - answer: <your clear answer derived strictly from the chunks>\n"
-        "   - citations: [<list of chunk_id strings containing the supporting evidence>]\n"
+        "   - answer: <factual answer derived strictly from the text chunks>\n"
+        "   - citations: [<list of chunk_id strings containing the evidence>]\n"
         "   - confidence: <float between 0.8 and 1.0>\n\n"
-        "NEVER use outside knowledge. Return strictly JSON with keys: answerable, answer, citations, confidence.\n\n"
+        "Return strictly JSON with keys: answerable, answer, citations, confidence.\n\n"
         f"QUESTION:\n{question}\n\n"
         f"CHUNKS:\n{json.dumps(chunks, indent=2)}"
     )
@@ -352,14 +352,29 @@ async def vector_search(request: Request):
     return {"matches": [d["doc_id"] for d in top_k_docs[:rerank_top_n]]}
 
 # ================= Q5: GraphRAG Endpoints =================
+VALID_ENTITY_TYPES = {
+    "person": "Person",
+    "organization": "Organization",
+    "product": "Product",
+    "framework": "Framework"
+}
+
+VALID_RELATIONS = {
+    "founded": "FOUNDED",
+    "developed": "DEVELOPED",
+    "integrated_into": "INTEGRATED_INTO",
+    "integratedinto": "INTEGRATED_INTO",
+    "hired": "HIRED",
+    "authored": "AUTHORED"
+}
+
 @app.post("/extract-graph")
 async def extract_graph(request: Request):
     body = await request.json()
     text = body.get("text", "") or body.get("content", "")
     prompt = (
         "You are an expert GraphRAG Entity and Relationship extractor.\n"
-        "Exhaustively extract ALL valid entities and ALL valid relationships from the provided text.\n"
-        "Do not leave out any entity or relationship that matches the allowed types.\n\n"
+        "Extract ALL valid entities and ALL valid relationships from the text.\n\n"
         "ALLOWED ENTITY TYPES ONLY:\n"
         "- Person\n"
         "- Organization\n"
@@ -371,27 +386,51 @@ async def extract_graph(request: Request):
         "- INTEGRATED_INTO\n"
         "- HIRED\n"
         "- AUTHORED\n\n"
-        "OUTPUT FORMAT:\n"
-        "Return ONLY a valid JSON object with keys \"entities\" and \"relationships\":\n"
+        "Rules:\n"
+        "1. Identify every person, company/organization, software/hardware product, and framework/library mentioned.\n"
+        "2. Identify every clear relationship between these entities matching one of the 5 allowed relationship types.\n"
+        "3. Output strictly a JSON object formatted as:\n"
         "{\n"
-        "  \"entities\": [\n"
-        "    {\"name\": \"Entity Name\", \"type\": \"Person|Organization|Product|Framework\"}\n"
-        "  ],\n"
-        "  \"relationships\": [\n"
-        "    {\"source\": \"Source Entity Name\", \"target\": \"Target Entity Name\", \"relation\": \"FOUNDED|DEVELOPED|INTEGRATED_INTO|HIRED|AUTHORED\"}\n"
-        "  ]\n"
+        "  \"entities\": [{\"name\": \"Entity Name\", \"type\": \"Person|Organization|Product|Framework\"}],\n"
+        "  \"relationships\": [{\"source\": \"Entity1\", \"target\": \"Entity2\", \"relation\": \"FOUNDED|DEVELOPED|INTEGRATED_INTO|HIRED|AUTHORED\"}]\n"
         "}\n\n"
         f"TEXT TO EXTRACT FROM:\n{text}"
     )
     try:
         out = parse_json(await chat([{"role": "user", "content": prompt}], model=config.TEXT_MODEL, max_tokens=2500))
-        entities = out.get("entities", [])
-        relationships = out.get("relationships", [])
-        if not isinstance(entities, list):
-            entities = []
-        if not isinstance(relationships, list):
-            relationships = []
-        return {"entities": entities, "relationships": relationships}
+        raw_entities = out.get("entities", [])
+        raw_relationships = out.get("relationships", [])
+
+        clean_entities = []
+        seen_entities = set()
+        if isinstance(raw_entities, list):
+            for e in raw_entities:
+                if isinstance(e, dict) and "name" in e and "type" in e:
+                    name = str(e["name"]).strip()
+                    raw_type = str(e["type"]).strip().lower()
+                    if name and raw_type in VALID_ENTITY_TYPES:
+                        canon_type = VALID_ENTITY_TYPES[raw_type]
+                        key = (name.lower(), canon_type)
+                        if key not in seen_entities:
+                            seen_entities.add(key)
+                            clean_entities.append({"name": name, "type": canon_type})
+
+        clean_rels = []
+        seen_rels = set()
+        if isinstance(raw_relationships, list):
+            for r in raw_relationships:
+                if isinstance(r, dict) and "source" in r and "target" in r and "relation" in r:
+                    src = str(r["source"]).strip()
+                    tgt = str(r["target"]).strip()
+                    raw_rel = str(r["relation"]).strip().lower().replace(" ", "_").replace("-", "_")
+                    if src and tgt and raw_rel in VALID_RELATIONS:
+                        canon_rel = VALID_RELATIONS[raw_rel]
+                        key = (src.lower(), tgt.lower(), canon_rel)
+                        if key not in seen_rels:
+                            seen_rels.add(key)
+                            clean_rels.append({"source": src, "target": tgt, "relation": canon_rel})
+
+        return {"entities": clean_entities, "relationships": clean_rels}
     except Exception:
         return {"entities": [], "relationships": []}
 
