@@ -129,15 +129,19 @@ Q4_DOCS = []
 Q4_EMBEDDINGS = {}
 Q4_RERANKER = {}
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
+def ensure_q4_data():
     global Q4_DOCS, Q4_EMBEDDINGS, Q4_RERANKER
-    try:
+    if not Q4_DOCS:
         docs, embs, reranker = generate_q4(config.EMAIL)
         Q4_DOCS = docs
         Q4_EMBEDDINGS = {k: np.array(v, dtype=np.float32) for k, v in embs.items()}
         Q4_RERANKER = reranker
         print(f"Q4 data generated for {config.EMAIL}: {len(Q4_DOCS)} docs.")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    try:
+        ensure_q4_data()
     except Exception as e:
         print(f"Failed to generate Q4 data: {e}")
     yield
@@ -183,6 +187,8 @@ async def chat(messages, model=None, max_tokens=800, force_json=True, retries=4)
     raise RuntimeError(f"chat failed after {retries} retries: {last_err}")
 
 def parse_json(s):
+    if not isinstance(s, str):
+        return {}
     s = s.strip()
     if s.startswith("```"):
         s = re.sub(r"^```[a-z]*\n?|\n?```$", "", s).strip()
@@ -190,7 +196,12 @@ def parse_json(s):
         return json.loads(s)
     except Exception:
         m = re.search(r"\{.*\}", s, re.DOTALL)
-        return json.loads(m.group(0)) if m else {}
+        if m:
+            try:
+                return json.loads(m.group(0))
+            except Exception:
+                pass
+        return {}
 
 @app.api_route("/", methods=["GET", "HEAD"])
 async def root():
@@ -217,18 +228,19 @@ async def q3_answer(request: Request):
     body = await request.json()
     question = body.get("question", "")
     chunks = body.get("chunks", [])
+    
     prompt = (
         "You are a highly reliable Grounded QA API for medical and legal compliance.\n"
         "Your task is to answer the user's question strictly using ONLY the provided context chunks.\n"
-        "1. If the question CANNOT be fully answered from the chunks (or if context is missing/irrelevant), you MUST return:\n"
+        "1. If the question CANNOT be fully and accurately answered from the context chunks (or if context is irrelevant/missing/insufficient), you MUST return:\n"
         "   - answerable: false\n"
         "   - answer: \"I don't know\"\n"
         "   - citations: []\n"
         "   - confidence: 0.1\n"
-        "2. If it CAN be answered strictly from the chunks, return:\n"
+        "2. If it CAN be directly answered from the chunks, return:\n"
         "   - answerable: true\n"
-        "   - answer: <your grounded answer>\n"
-        "   - citations: [<list of chunk_id strings used>]\n"
+        "   - answer: <your grounded answer derived ONLY from the chunks>\n"
+        "   - citations: [<list of chunk_id strings containing the supporting evidence>]\n"
         "   - confidence: <float between 0.8 and 1.0>\n"
         "NEVER use outside knowledge. Return strictly JSON with exactly these 4 keys.\n\n"
         f"QUESTION:\n{question}\n\n"
@@ -258,7 +270,6 @@ async def q3_answer(request: Request):
     except Exception:
         return {"answer": "I don't know", "citations": [], "confidence": 0.1, "answerable": False}
 
-
 # ================= Q4: /vector-search =================
 def cosine_sim(a, b):
     norm_a = np.linalg.norm(a)
@@ -269,29 +280,42 @@ def cosine_sim(a, b):
 
 @app.post("/vector-search")
 async def vector_search(request: Request):
+    ensure_q4_data()
     body = await request.json()
     query_id = body.get("query_id")
     query_vector = np.array(body.get("query_vector", []), dtype=np.float32)
-    top_k = body.get("top_k", 10)
-    rerank_top_n = body.get("rerank_top_n", 3)
-    filters = body.get("filter", {})
+    top_k = int(body.get("top_k", 10))
+    rerank_top_n = int(body.get("rerank_top_n", 3))
+    filters = body.get("filter") or body.get("filters") or {}
+
     # 1. Filter documents
     filtered_docs = []
     for doc in Q4_DOCS:
         match = True
-        for key, condition in filters.items():
-            if isinstance(condition, dict):
-                if "gte" in condition and not (doc.get(key, 0) >= condition["gte"]):
-                    match = False
-                if "lte" in condition and not (doc.get(key, 0) <= condition["lte"]):
-                    match = False
-                if "in" in condition and doc.get(key) not in condition["in"]:
-                    match = False
-            else:
-                if doc.get(key) != condition:
-                    match = False
+        if isinstance(filters, dict):
+            for key, condition in filters.items():
+                val = doc.get(key)
+                if isinstance(condition, dict):
+                    if "gte" in condition and not (val is not None and val >= condition["gte"]):
+                        match = False
+                    if "lte" in condition and not (val is not None and val <= condition["lte"]):
+                        match = False
+                    if "gt" in condition and not (val is not None and val > condition["gt"]):
+                        match = False
+                    if "lt" in condition and not (val is not None and val < condition["lt"]):
+                        match = False
+                    if "in" in condition and val not in condition["in"]:
+                        match = False
+                    if "eq" in condition and val != condition["eq"]:
+                        match = False
+                    if "ne" in condition and val == condition["ne"]:
+                        match = False
+                else:
+                    if val != condition:
+                        match = False
         if match:
             filtered_docs.append(doc)
+
     # 2. Cosine similarity
     scored_docs = []
     for doc in filtered_docs:
@@ -300,13 +324,16 @@ async def vector_search(request: Request):
         if doc_emb is not None:
             sim = cosine_sim(query_vector, doc_emb)
             scored_docs.append({"doc_id": doc_id, "sim": sim})
+
     # 3. Top-k (desc sim, tie-break lexicographic)
     scored_docs.sort(key=lambda x: (-x["sim"], x["doc_id"]))
     top_k_docs = scored_docs[:top_k]
+
     # 4. Re-rank
     rerank_scores = Q4_RERANKER.get(query_id, {})
     for doc in top_k_docs:
         doc["rerank_score"] = rerank_scores.get(doc["doc_id"], -999.0)
+
     top_k_docs.sort(key=lambda x: (-x["rerank_score"], x["doc_id"]))
     return {"matches": [d["doc_id"] for d in top_k_docs[:rerank_top_n]]}
 
@@ -314,7 +341,7 @@ async def vector_search(request: Request):
 @app.post("/extract-graph")
 async def extract_graph(request: Request):
     body = await request.json()
-    text = body.get("text", "")
+    text = body.get("text", "") or body.get("content", "")
     prompt = (
         "You are an expert GraphRAG Entity and Relationship extractor.\n"
         "Extract entities and relationships from the provided text according to these EXACT rules:\n"
@@ -328,15 +355,21 @@ async def extract_graph(request: Request):
         f"TEXT:\n{text}"
     )
     try:
-        out = parse_json(await chat([{"role": "user", "content": prompt}], model="gpt-4o", max_tokens=1500))
-        return {"entities": out.get("entities", []), "relationships": out.get("relationships", [])}
+        out = parse_json(await chat([{"role": "user", "content": prompt}], model=config.TEXT_MODEL, max_tokens=1500))
+        entities = out.get("entities", [])
+        relationships = out.get("relationships", [])
+        if not isinstance(entities, list):
+            entities = []
+        if not isinstance(relationships, list):
+            relationships = []
+        return {"entities": entities, "relationships": relationships}
     except Exception:
         return {"entities": [], "relationships": []}
 
 @app.post("/graph-query")
 async def graph_query(request: Request):
     body = await request.json()
-    question = body.get("question", "")
+    question = body.get("question", "") or body.get("query", "")
     graph = body.get("graph", {})
     prompt = (
         "You are a GraphRAG multi-hop reasoning agent.\n"
@@ -352,16 +385,21 @@ async def graph_query(request: Request):
         f"GRAPH:\n{json.dumps(graph, indent=2)}"
     )
     try:
-        out = parse_json(await chat([{"role": "user", "content": prompt}], model="gpt-4o", max_tokens=1500))
+        out = parse_json(await chat([{"role": "user", "content": prompt}], model=config.TEXT_MODEL, max_tokens=1500))
         path = out.get("reasoning_path", [])
-        return {"answer": out.get("answer", ""), "reasoning_path": path, "hops": len(path) - 1 if path else 0}
+        if not isinstance(path, list):
+            path = []
+        hops = out.get("hops")
+        if hops is None or not isinstance(hops, int):
+            hops = max(0, len(path) - 1) if path else 0
+        return {"answer": str(out.get("answer", "")), "reasoning_path": path, "hops": int(hops)}
     except Exception:
         return {"answer": "", "reasoning_path": [], "hops": 0}
 
 @app.post("/community-summary")
 async def community_summary(request: Request):
     body = await request.json()
-    community_id = body.get("community_id", "")
+    community_id = str(body.get("community_id", "") or body.get("id", ""))
     entities = body.get("entities", [])
     relationships = body.get("relationships", [])
     prompt = (
@@ -376,7 +414,7 @@ async def community_summary(request: Request):
         f"RELATIONSHIPS:\n{json.dumps(relationships, indent=2)}"
     )
     try:
-        out = parse_json(await chat([{"role": "user", "content": prompt}], model="gpt-4o", max_tokens=1500))
-        return {"community_id": community_id, "summary": out.get("summary", "")}
+        out = parse_json(await chat([{"role": "user", "content": prompt}], model=config.TEXT_MODEL, max_tokens=1500))
+        return {"community_id": community_id, "summary": str(out.get("summary", ""))}
     except Exception:
         return {"community_id": community_id, "summary": ""}
