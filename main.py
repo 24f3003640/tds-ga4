@@ -1,4 +1,6 @@
+# GA4 FastAPI Backend Service
 import json, re, hashlib, os, math, struct
+
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
